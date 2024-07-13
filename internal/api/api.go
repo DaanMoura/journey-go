@@ -2,11 +2,13 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"journey/internal/api/spec"
 	"journey/internal/pgstore"
 	"net/http"
 
+	"github.com/go-playground/validator/v10"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -14,17 +16,21 @@ import (
 )
 
 type store interface {
+	CreateTrip(ctx context.Context, pool *pgxpool.Pool, params spec.CreateTripRequest) (uuid.UUID, error)
 	GetParticipant(ctx context.Context, participantID uuid.UUID) (pgstore.Participant, error)
 	ConfirmParticipant(ctx context.Context, participantID uuid.UUID) error
 }
 
 type API struct {
-	store  store
-	logger *zap.Logger
+	store     store
+	logger    *zap.Logger
+	validator *validator.Validate
+	pool      *pgxpool.Pool
 }
 
 func NewAPI(pool *pgxpool.Pool, logger *zap.Logger) API {
-	return API{pgstore.New(pool), logger}
+	validator := validator.New(validator.WithRequiredStructEnabled())
+	return API{pgstore.New(pool), logger, validator, pool}
 }
 
 // Confirms a participant on a trip.
@@ -36,17 +42,17 @@ func (api API) PatchParticipantsParticipantIDConfirm(
 ) *spec.Response {
 	id, err := uuid.Parse(participantID)
 	if err != nil {
-		return spec.PatchParticipantsParticipantIDConfirmJSON400Response(spec.Error{Message: "invalid uuid"})
+		return spec.PatchParticipantsParticipantIDConfirmJSON400Response(spec.Error{Message: "Invalid uuid"})
 	}
 
 	participant, err := api.store.GetParticipant(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return spec.PatchParticipantsParticipantIDConfirmJSON400Response(spec.Error{Message: "participant not found"})
+			return spec.PatchParticipantsParticipantIDConfirmJSON400Response(spec.Error{Message: "Participant not found"})
 		}
 
 		api.logger.Error("failed to confirm participant", zap.Error(err), zap.String("participant_id", participantID))
-		return spec.PatchParticipantsParticipantIDConfirmJSON400Response(spec.Error{Message: "internal server error"})
+		return spec.PatchParticipantsParticipantIDConfirmJSON400Response(spec.Error{Message: "Internal server error"})
 	}
 
 	if participant.IsConfirmed {
@@ -57,7 +63,7 @@ func (api API) PatchParticipantsParticipantIDConfirm(
 
 	if err := api.store.ConfirmParticipant(r.Context(), id); err != nil {
 		api.logger.Error("failed to confirm participant", zap.Error(err), zap.String("participant_id", participantID))
-		return spec.PatchParticipantsParticipantIDConfirmJSON400Response(spec.Error{Message: "internal server error"})
+		return spec.PatchParticipantsParticipantIDConfirmJSON400Response(spec.Error{Message: "Internal server error"})
 	}
 
 	return spec.PatchParticipantsParticipantIDConfirmJSON204Response(nil)
@@ -66,7 +72,22 @@ func (api API) PatchParticipantsParticipantIDConfirm(
 // Create a new trip
 // (POST /trips)
 func (api API) PostTrips(w http.ResponseWriter, r *http.Request) *spec.Response {
-	panic("not implemented") // TODO: Implement
+	var body spec.CreateTripRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		return spec.PostTripsJSON400Response(spec.Error{Message: "Invalid JSON"})
+	}
+
+	if err := api.validator.Struct(body); err != nil {
+		return spec.PostTripsJSON400Response(spec.Error{Message: "Invalid JSON. Details: " + err.Error()})
+	}
+
+	tripID, err := api.store.CreateTrip(r.Context(), api.pool, body)
+	if err != nil {
+		api.logger.Error("Failed to create trip", zap.Error(err))
+		return spec.PostTripsJSON400Response(spec.Error{Message: "Internal server error. Failed to create trip, try again"})
+	}
+
+	return spec.PostTripsJSON201Response(spec.CreateTripResponse{TripID: tripID.String()})
 }
 
 // Get a trip details.
